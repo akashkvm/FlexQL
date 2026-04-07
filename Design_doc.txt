@@ -1,0 +1,252 @@
+FlexQL — Design Document
+
+1) Project Overview
+
+FlexQL is a persistent, SQL-like database engine designed for high-throughput insert-heavy workloads (benchmarks up to 10M rows). It is implemented in C++17 as a standalone TCP server plus a small C/C++ client library and an interactive REPL.
+
+Key goals reflected in the implementation:
+- High insert throughput via a fast INSERT parser and batched workload patterns.
+- Persistence across runs via a Write-Ahead Log (WAL) and per-table heap files.
+- Simple SQL subset sufficient for the provided benchmark and interactive exploration.
+
+
+2) Repository Structure
+
+- include/flexql.h
+  Public client API header (opaque handle + 4 functions):
+  - flexql_open(host, port, &db)
+  - flexql_close(db)
+  - flexql_exec(db, sql, callback, arg, &errmsg)
+  - flexql_free(ptr)
+
+- src/server/server.cpp
+  The database server: TCP listener, SQL execution engine, WAL + heap storage, and recovery.
+
+- src/client/flexql_api.cpp
+  Implementation of the public API: TCP connection management + response parsing.
+
+- src/client/repl.cpp
+  Interactive terminal client using the API; prints SELECT results in a MySQL-like table.
+
+- tests/benchmark_flexql.cpp
+  Benchmark + unit tests harness (used by Makefile targets).
+
+- flexql_data/
+  Runtime persistence directory created by the server:
+  - wal.log
+  - <TABLE>.heap
+
+
+3) Build and Run
+
+Build:
+- make
+
+Run benchmark/unit tests (Makefile orchestrates server + benchmark client):
+- make run-unit
+- make run-1m
+- make run-10m
+
+Manual interactive mode:
+- Terminal 1: ./bin/flexql-server 9000
+- Terminal 2: ./bin/flexql-client 127.0.0.1 9000
+
+
+4) High-Level Architecture
+
+FlexQL is split into two processes:
+
+4.1) Server process (flexql-server)
+- Owns all database state.
+- Accepts SQL strings over TCP.
+- Executes SQL against in-memory table structures.
+- Persists changes to disk via memory-mapped WAL and heap files.
+- Serializes results back to the client using a simple line-based protocol.
+
+4.2) Client process(es)
+Two client entry points exist:
+- A C API (flexql_open/exec/close) used by the benchmark.
+- A REPL program (flexql-client) using the same API.
+
+
+5) Data Model
+
+5.1) Schema
+Each table has a Schema:
+- table_name
+- columns: list of ColumnDef
+  - name (stored upper-cased)
+  - type (normalized to DECIMAL or VARCHAR)
+  - primary_key
+  - not_null
+- pk_col_idx
+
+5.2) Row representation
+A Row contains:
+- values: vector<string> holding the column values (stored as text)
+- expires_at: int64_t (timestamp seconds), default 0
+  - is_expired() checks current time against expires_at.
+
+Note: The benchmark-oriented design favors fast parsing and persistence. Values are stored as strings; numeric comparisons attempt stod() first and fall back to lexicographic comparison.
+
+5.3) Table
+A Table contains:
+- schema
+- rows: vector<Row>
+- heap: pointer to a per-table MmapHeap
+- pk_index: unordered_map<string, size_t> mapping PK value to row index (in non-bench-fast mode)
+
+In FLEXQL_BENCH_FAST mode, the server may avoid storing full rows and instead track only a hash set of PKs.
+
+
+6) Persistence Design
+
+FlexQL persists data under flexql_data/ using two memory-mapped file types.
+
+6.1) Write-Ahead Log (WAL)
+File: flexql_data/wal.log
+Implementation: struct MmapWAL in src/server/server.cpp
+
+Design:
+- The file is pre-sized (WAL_CAPACITY) and memory-mapped MAP_SHARED.
+- A header page stores:
+  - magic
+  - write_off (append pointer)
+  - sync_off (last async sync boundary)
+  - nrecords
+- Records are appended sequentially:
+  - [type:1][tname_len:1][tname][payload_len:4][payload]
+- WAL flush behavior:
+  - Uses msync(..., MS_ASYNC) periodically (ASYNC_BYTES threshold) and on destruction.
+  - This favors throughput (no fsync on hot path) over strict durability on every statement.
+
+Record types:
+- CREATE_TABLE
+- INSERT
+- DELETE_ALL
+
+6.2) Per-table heap files
+File: flexql_data/<TABLE>.heap
+Implementation: struct MmapHeap
+
+Design:
+- Each heap is pre-sized (HEAP_CAPACITY) and memory-mapped MAP_SHARED.
+- A header page stores:
+  - magic
+  - nrows
+  - write_off
+- Appends are memcpy-based:
+  - Row record format:
+    [ncols:2][col_len:2 col_data]... [expires_at:8]
+
+6.3) Recovery
+On server startup:
+- Data directory is created if missing.
+- WAL is opened and mapped.
+- Recovery replays WAL records to reconstruct schemas and repopulate in-memory tables.
+
+Persistence invariant:
+- The WAL is authoritative for recovery order.
+- Heap files provide an additional append-only store, but correctness is primarily ensured by WAL replay.
+
+
+7) Query Execution
+
+The Executor class is the main execution facade:
+- Executor::init() opens the WAL mapping.
+- Executor::execute(raw_sql) normalizes input and dispatches by keyword.
+
+7.1) Parsing strategy
+Two parsing paths are used:
+- INSERT: a specialized zero-copy-ish char* scanner optimized for speed.
+  - Avoids tokenization.
+  - Reuses a Row object and per-column string buffers.
+  - Builds a tab-separated WAL payload per row.
+
+- CREATE/SELECT/DELETE: a general tokenizer that splits SQL into tokens, supporting:
+  - quotes
+  - operators (=, !=, >, >=, <, <=)
+  - parentheses, commas, semicolons
+
+7.2) Supported statement families (as implemented)
+- CREATE TABLE ... (columns, PRIMARY KEY, NOT NULL; optional IF NOT EXISTS handling)
+- INSERT INTO ... VALUES (...),(...),...;
+- SELECT ... with filtering and optional ordering (implementation-dependent)
+- DELETE ... (implementation-dependent; includes DELETE_ALL WAL type)
+
+
+8) Networking and Wire Protocol
+
+8.1) Transport
+- TCP sockets on a user-specified port.
+- Client sends raw SQL terminated by ';'.
+
+8.2) Server-to-client response format
+The server serializes QueryResult as line-oriented text:
+- For each result row:
+  ROW <N> <len:name>:<name><len:val>:<val>...\n
+- Then one of:
+  OK\nEND\n
+  or
+  ERROR: <msg>\nEND\n
+The END line terminates the response to a single statement.
+
+8.3) Client parsing
+flexql_api.cpp reads from the socket until END is observed.
+- If a line begins with "ROW ", it parses the payload and fires the callback.
+- If it sees "ERROR:", it returns FLEXQL_ERROR and sets errmsg.
+
+Backwards compatibility:
+- If ROW payload parsing fails, the client passes the raw row payload as a single column "row".
+
+
+9) Performance-Oriented Choices
+
+- Memory mapping (mmap) for WAL and heap:
+  - Appends become memcpy to mapped pages.
+  - Avoids per-row syscalls and reduces fsync overhead.
+
+- Pre-allocation:
+  - Tables reserve capacity for rows and PK index (RESERVE_ROWS) to reduce reallocations.
+
+- Specialized INSERT parser:
+  - Minimizes allocations.
+  - Parses values directly into pre-sized buffers.
+
+- Optional timing:
+  - Timing output can be disabled via FLEXQL_DISABLE_TIMING (enabled in Makefile flags).
+
+
+10) Error Handling and Limitations
+
+- Error reporting to clients is string-based ("ERROR: ...").
+- Durability is optimized for throughput:
+  - msync(MS_ASYNC) does not guarantee immediate persistence to disk.
+- SQL support is intentionally partial and benchmark-driven.
+- Data typing is simplified (DECIMAL vs VARCHAR). Numeric comparisons attempt parsing at runtime.
+- Concurrency model is server-managed; behavior with many concurrent clients is implementation-dependent.
+
+
+11) How to Extend
+
+Common extension points:
+- Add new WAL record types (MmapWAL::Type) and update recovery replay.
+- Extend tokenizer and SELECT parsing to support more SQL clauses.
+- Add stronger durability modes (e.g., optional MS_SYNC or fdatasync per transaction/batch).
+- Add secondary indexes or improve query planning beyond scans.
+
+
+12) Entry Points
+
+- Server binary:
+  - src/server/server.cpp (main lives here)
+
+- Client API:
+  - include/flexql.h (public)
+  - src/client/flexql_api.cpp (implementation)
+
+- REPL:
+  - src/client/repl.cpp
+
+
+End of Design_doc.txt
