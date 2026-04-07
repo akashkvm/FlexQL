@@ -248,5 +248,3 @@ Common extension points:
 - REPL:
   - src/client/repl.cpp
 
-
-End of Design_doc.txt
